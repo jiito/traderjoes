@@ -15,6 +15,16 @@ from typing import List, Dict, Optional
 
 import requests
 
+# Optional Selenium imports
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
 
 class TraderJoesAPI:
     """Handler for Trader Joe's GraphQL API interactions."""
@@ -40,36 +50,90 @@ class TraderJoesAPI:
         self.session.headers.update(self.BASE_HEADERS)
         self._initialize_session()
 
-    def _initialize_session(self):
-        """Initialize session with fallback affinity cookie."""
-        # Get cookie from environment variable or use default
-        # To get a new one: Open browser dev tools, visit traderjoes.com, check Application > Cookies > affinity
-        fallback_cookie = os.getenv("TJ_AFFINITY_COOKIE", "6e56efa815f07aa2")
-
-        print("Initializing session with Trader Joe's...")
+    def _get_selenium_cookie(self):
+        """Get affinity cookie using Selenium (automated browser)."""
+        if not SELENIUM_AVAILABLE:
+            return None
 
         try:
-            # Try to get cookie dynamically (may not work due to bot detection)
-            product_page = "https://www.traderjoes.com/home/products/pdp/organic-ground-beef-8515-092558"
-            session_headers = {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            }
+            print("🤖 Using automated browser to get fresh cookie...")
 
-            response = self.session.get(product_page, headers=session_headers, timeout=5)
+            # Setup Chrome options
+            options = Options()
+            options.add_argument('--headless')  # Run in background
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--window-size=1920x1080')
+            options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36')
 
-            # Check for affinity cookie
-            for cookie in self.session.cookies:
-                if cookie.name == 'affinity':
-                    print(f"✅ Got dynamic affinity cookie: {cookie.value}")
-                    return
+            # Setup webdriver
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
 
-        except:
-            pass
+            try:
+                # Visit the product page that sets the affinity cookie
+                driver.get('https://www.traderjoes.com/home/products')
 
-        # Use reliable fallback
-        print(f"Using fallback affinity cookie (you can update this if needed)")
+                # Wait a moment for page to load
+                time.sleep(2)
+
+                # Get the affinity cookie
+                affinity_cookie = driver.get_cookie('affinity')
+
+                if affinity_cookie:
+                    cookie_value = affinity_cookie['value']
+                    print(f"✅ Got fresh Selenium cookie: {cookie_value}")
+                    return cookie_value
+                else:
+                    print("⚠️  No affinity cookie found via Selenium")
+                    return None
+
+            finally:
+                driver.quit()
+
+        except Exception as e:
+            print(f"⚠️  Selenium cookie retrieval failed: {e}")
+            return None
+
+    def _initialize_session(self):
+        """Initialize session with fallback cookie first."""
+        fallback_cookie = os.getenv("TJ_AFFINITY_COOKIE", "6e56efa815f07aa2")
+        print("Initializing session with Trader Joe's...")
+
+        # Start with fast fallback approach
+        print(f"📋 Using fallback cookie (Selenium available if needed)")
         self.session.cookies.set('affinity', fallback_cookie)
+
+    def _refresh_cookie_with_selenium(self):
+        """Refresh cookie using Selenium when fallback fails."""
+        if not SELENIUM_AVAILABLE:
+            print("⚠️  Selenium not available for cookie refresh")
+            return False
+
+        selenium_cookie = self._get_selenium_cookie()
+        if selenium_cookie:
+            self.session.cookies.set('affinity', selenium_cookie)
+            return True
+        return False
+
+    def _make_request_with_retry(self, method, url, **kwargs):
+        """Make request with automatic cookie refresh on 403."""
+        try:
+            response = getattr(self.session, method)(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403:
+                print("🔄 Got 403 error, refreshing cookie with Selenium...")
+                if self._refresh_cookie_with_selenium():
+                    print("🔄 Retrying with fresh cookie...")
+                    response = getattr(self.session, method)(url, **kwargs)
+                    response.raise_for_status()
+                    return response
+                else:
+                    print("❌ Cookie refresh failed")
+            raise
 
     def fetch_products_by_store(self, store_code: str, page: int = 1, page_size: int = 100) -> Optional[Dict]:
         """Fetch products for a specific store and page."""
@@ -121,8 +185,7 @@ class TraderJoesAPI:
         }
 
         try:
-            response = self.session.post(self.BASE_URL, json=payload)
-            response.raise_for_status()
+            response = self._make_request_with_retry('post', self.BASE_URL, json=payload)
             return response.json()
         except requests.RequestException as e:
             print(f"Error fetching page {page} for store {store_code}: {e}")
@@ -171,8 +234,7 @@ class TraderJoesAPI:
         }
 
         try:
-            response = self.session.post(self.BASE_URL, json=payload)
-            response.raise_for_status()
+            response = self._make_request_with_retry('post', self.BASE_URL, json=payload)
             return response.json()
         except requests.RequestException as e:
             print(f"Error searching for '{search_term}': {e}")
@@ -208,8 +270,7 @@ class TraderJoesAPI:
         }
 
         try:
-            response = self.session.post(self.BASE_URL, json=payload)
-            response.raise_for_status()
+            response = self._make_request_with_retry('post', self.BASE_URL, json=payload)
             return response.json()
         except requests.RequestException as e:
             print(f"Error fetching SKUs {skus}: {e}")
